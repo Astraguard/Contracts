@@ -1,0 +1,7 @@
+/target
+**/target
+*.wasm
+.env
+.env.local
+.soroban
+**/test_snapshots/
