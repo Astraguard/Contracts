@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/shared",
+    "contracts/escrow",
+    "contracts/insurance-pool",
+    "contracts/registry-anchor",
+]
+
+[workspace.dependencies]
+soroban-sdk = "26.1.0"
+astraguard-shared = { path = "contracts/shared" }
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+strip = "symbols"
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
