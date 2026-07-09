@@ -1,0 +1,8 @@
+{
+  "network": "testnet",
+  "contracts": {
+    "escrow": null,
+    "insurance-pool": null,
+    "registry-anchor": null
+  }
+}
