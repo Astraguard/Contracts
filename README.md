@@ -1,6 +1,6 @@
 # Astraguard Contracts
 
-[![Soroban Contract CI](https://github.com/your-org/astraguard/actions/workflows/contract-ci.yml/badge.svg)](https://github.com/your-org/astraguard/actions/workflows/contract-ci.yml)
+[![Soroban Contract CI](https://github.com/Astraguard/Contracts/actions/workflows/contract-ci.yml/badge.svg)](https://github.com/Astraguard/Contracts/actions/workflows/contract-ci.yml)
 
 Soroban smart contracts for Astraguard, the trust and safety layer for Stellar: conditional payment escrow with dispute resolution, an insurance pool that backs verified projects with real coverage, and a registry anchor that timestamps confirmed fraud flags on-chain for public auditability.
 
@@ -378,7 +378,7 @@ MIT
 
 ## Support
 
-- GitHub Issues: [Create an issue](https://github.com/your-org/astraguard/issues)
+- GitHub Issues: [Create an issue](https://github.com/Astraguard/Contracts/issues)
 - Stellar Discord: https://discord.gg/stellar
 - Stellar Developers: https://developers.stellar.org
 
