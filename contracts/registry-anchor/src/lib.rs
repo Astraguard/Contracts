@@ -144,4 +144,18 @@ impl RegistryAnchorContract {
     pub fn accept_admin(env: Env) -> Address {
         timelock::execute_admin_change(&env)
     }
+
+    /// Admin proposes a new oracle address. The proposal enters a 48-hour
+    /// timelock (same as admin handover) before `accept_oracle` can execute
+    /// it, giving observers a window to notice and react to a compromised
+    /// oracle key before it is formally replaced.
+    pub fn propose_oracle(env: Env, candidate: Address) {
+        timelock::propose_oracle_change(&env, candidate);
+    }
+
+    /// Executes a previously proposed oracle change once the 48-hour
+    /// timelock has elapsed. Callable by anyone — the delay is the guard.
+    pub fn accept_oracle(env: Env) -> Address {
+        timelock::execute_oracle_change(&env)
+    }
 }
