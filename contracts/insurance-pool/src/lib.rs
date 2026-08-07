@@ -28,6 +28,10 @@ pub enum Error {
     ClaimNotApproved = 7,
     ClaimAlreadySettled = 8,
     InsufficientPoolBalance = 9,
+    /// Returned when trying to add a member who is already on the committee.
+    AlreadyCommitteeMember = 10,
+    /// Returned when trying to remove a member who is not on the committee.
+    MemberNotFound = 11,
 }
 
 #[contracttype]
@@ -421,6 +425,74 @@ impl InsurancePoolContract {
 
     pub fn accept_admin(env: Env) -> Address {
         timelock::execute_admin_change(&env)
+    }
+
+    /// Admin proposes a new oracle address. The proposal enters a 48-hour
+    /// timelock (same as admin handover) before `accept_oracle` can execute
+    /// it, giving observers a window to notice and react to a compromised
+    /// oracle key before it is formally replaced.
+    pub fn propose_oracle(env: Env, candidate: Address) {
+        timelock::propose_oracle_change(&env, candidate);
+    }
+
+    /// Executes a previously proposed oracle change once the 48-hour
+    /// timelock has elapsed. Callable by anyone — the delay is the guard.
+    pub fn accept_oracle(env: Env) -> Address {
+        timelock::execute_oracle_change(&env)
+    }
+
+    /// Admin-only: add a new member to the claims committee. Errors if the
+    /// address is already a member (idempotency guard).
+    pub fn add_committee_member(env: Env, member: Address) -> Result<(), Error> {
+        access::require_admin(&env);
+        let mut committee: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Committee)
+            .unwrap_or(Vec::new(&env));
+        if committee.iter().any(|m| &m == &member) {
+            return Err(Error::AlreadyCommitteeMember);
+        }
+        committee.push_back(member.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Committee, &committee);
+        ttl::bump_instance(&env);
+
+        env.events()
+            .publish((Symbol::new(&env, "committee_added"),), member);
+        Ok(())
+    }
+
+    /// Admin-only: remove a member from the claims committee. Errors if the
+    /// address is not currently a member.
+    pub fn remove_committee_member(env: Env, member: Address) -> Result<(), Error> {
+        access::require_admin(&env);
+        let committee: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Committee)
+            .unwrap_or(Vec::new(&env));
+        let mut updated: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for m in committee.iter() {
+            if &m == &member {
+                found = true;
+            } else {
+                updated.push_back(m);
+            }
+        }
+        if !found {
+            return Err(Error::MemberNotFound);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Committee, &updated);
+        ttl::bump_instance(&env);
+
+        env.events()
+            .publish((Symbol::new(&env, "committee_removed"),), member);
+        Ok(())
     }
 
     fn asset(env: &Env) -> Address {
