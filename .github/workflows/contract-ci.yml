@@ -30,3 +30,69 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSL https://raw.githubusercontent.com/stellar/stellar-cli/main/install.sh \
+            | bash -s -- --yes
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run scripts/build.sh (stellar contract optimize)
+        run: bash scripts/build.sh
+
+  validate-deployments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate deployments JSON structure
+        run: |
+          set -euo pipefail
+
+          REQUIRED_KEYS='["escrow","insurance-pool","registry-anchor"]'
+
+          for file in deployments/*.json; do
+            echo "Checking ${file}..."
+
+            # Must be valid JSON
+            jq empty "$file"
+
+            # Top-level "network" key must be a non-empty string
+            network=$(jq -r '.network // empty' "$file")
+            if [[ -z "$network" ]]; then
+              echo "ERROR: ${file} is missing or has a null/empty 'network' field" >&2
+              exit 1
+            fi
+
+            # Top-level "contracts" object must exist
+            contracts_type=$(jq -r 'if .contracts | type == "object" then "ok" else "bad" end' "$file")
+            if [[ "$contracts_type" != "ok" ]]; then
+              echo "ERROR: ${file} is missing the 'contracts' object" >&2
+              exit 1
+            fi
+
+            # All three required contract keys must be present (values may be null for undeployed placeholders)
+            missing=$(jq -r \
+              --argjson required "$REQUIRED_KEYS" \
+              '($required - (.contracts | keys)) | if length > 0 then "missing: \(join(", "))" else empty end' \
+              "$file")
+            if [[ -n "$missing" ]]; then
+              echo "ERROR: ${file} contracts object is ${missing}" >&2
+              exit 1
+            fi
+
+            # Each contract value must be either null (placeholder) or a non-empty string (contract ID)
+            bad_values=$(jq -r \
+              '.contracts | to_entries[] |
+               select(.value != null and (.value | type) != "string") |
+               "key \(.key) has invalid type \(.value | type)"' \
+              "$file")
+            if [[ -n "$bad_values" ]]; then
+              echo "ERROR: ${file} has invalid contract value(s): ${bad_values}" >&2
+              exit 1
+            fi
+
+            echo "  OK (network=${network})"
+          done
+
+          echo "All deployment files are well-formed."
