@@ -143,3 +143,132 @@ fn non_committee_member_cannot_approve_or_reject() {
     let result = client.try_reject_claim(&claim_id, &stranger);
     assert_eq!(result, Err(Ok(Error::NotCommitteeMember)));
 }
+
+// =============================================================================
+// Timelocked admin and oracle handover — wiring tests for the insurance-pool
+// =============================================================================
+
+fn setup_pool(env: &Env) -> InsurancePoolContractClient<'_> {
+    let admin = Address::generate(env);
+    let oracle = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let (asset, _, _) = issue_token(env, &token_admin);
+    let contract_id = env.register(InsurancePoolContract, ());
+    let client = InsurancePoolContractClient::new(env, &contract_id);
+    client.initialize(&admin, &oracle, &asset, &5_000u32, &vec![env], &1u32);
+    client
+}
+
+#[test]
+fn admin_handover_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup_pool(&env);
+    let new_admin = Address::generate(&env);
+
+    let t0: u64 = 1_000_000;
+    env.ledger().set_timestamp(t0);
+
+    client.propose_admin(&new_admin);
+
+    env.ledger().set_timestamp(t0 + 172_800);
+
+    let returned = client.accept_admin();
+    assert_eq!(returned, new_admin);
+}
+
+#[test]
+#[should_panic(expected = "timelock not elapsed")]
+fn admin_handover_too_early_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup_pool(&env);
+    let new_admin = Address::generate(&env);
+
+    let t0: u64 = 1_000_000;
+    env.ledger().set_timestamp(t0);
+
+    client.propose_admin(&new_admin);
+    env.ledger().set_timestamp(t0 + 172_800 - 1);
+    client.accept_admin();
+}
+
+#[test]
+#[should_panic(expected = "no pending admin change")]
+fn admin_handover_no_pending_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup_pool(&env);
+    client.accept_admin();
+}
+
+#[test]
+fn admin_handover_second_propose_overwrites_first() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup_pool(&env);
+    let candidate_a = Address::generate(&env);
+    let candidate_b = Address::generate(&env);
+
+    let t0: u64 = 1_000_000;
+    env.ledger().set_timestamp(t0);
+
+    client.propose_admin(&candidate_a);
+    env.ledger().set_timestamp(t0 + 60);
+    client.propose_admin(&candidate_b);
+
+    env.ledger().set_timestamp(t0 + 60 + 172_800);
+
+    let result = client.accept_admin();
+    assert_eq!(result, candidate_b);
+}
+
+#[test]
+fn oracle_handover_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup_pool(&env);
+    let new_oracle = Address::generate(&env);
+
+    let t0: u64 = 1_000_000;
+    env.ledger().set_timestamp(t0);
+
+    client.propose_oracle(&new_oracle);
+
+    env.ledger().set_timestamp(t0 + 172_800);
+
+    let returned = client.accept_oracle();
+    assert_eq!(returned, new_oracle);
+}
+
+#[test]
+#[should_panic(expected = "timelock not elapsed")]
+fn oracle_handover_too_early_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup_pool(&env);
+    let new_oracle = Address::generate(&env);
+
+    let t0: u64 = 1_000_000;
+    env.ledger().set_timestamp(t0);
+
+    client.propose_oracle(&new_oracle);
+    env.ledger().set_timestamp(t0 + 172_800 - 1);
+    client.accept_oracle();
+}
+
+#[test]
+#[should_panic(expected = "no pending oracle change")]
+fn oracle_handover_no_pending_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client = setup_pool(&env);
+    client.accept_oracle();
+}
