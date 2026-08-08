@@ -318,7 +318,7 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 - [ ] Cross-contract integration tests (see `tests/README.md`)
 - [ ] Validate TTL threshold/bump constants against target network rent economics
 - [ ] External audit
-- [ ] Mainnet launch
+- [ ] Mainnet launch — see [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md) for the full gate checklist (closes #11)
 
 ## Dependencies
 
