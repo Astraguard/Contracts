@@ -144,8 +144,12 @@ Outcomes enforced on-chain once an arbiter resolves a dispute (`Decision`):
 ### `registry-anchor`
 
 - `initialize(admin, oracle)`
-- `anchor_flag(subject, record_hash, category)` — **oracle-only**; timestamp is taken from the ledger clock, not a caller-supplied argument, so flags can't be backdated
-- `get_flag(flag_id)`, `get_flags_for_subject(subject)` — queries
+- `anchor_flag(subject, record_hash, category)` — **oracle-only**; timestamp is taken from the ledger clock, not a caller-supplied argument, so flags can't be backdated; returns `flag_id`
+- `supersede_flag(flag_id, reason_hash)` — **oracle-only**; marks a previously anchored flag as retracted/corrected without deleting the original record (tamper-evidence is preserved). `reason_hash` is the hash of the off-chain correction document. Returns the written `Supersession`. Errors with `AlreadySuperseded` if called twice on the same flag.
+- `get_flag(flag_id)` — returns the raw `Flag`; does **not** indicate supersession on its own
+- `get_supersession(flag_id)` — returns `Some(Supersession)` if the flag has been retracted, `None` if it is still live
+- `get_flag_with_supersession(flag_id)` — preferred query; returns `FlagWithSupersession { flag, supersession }` so consumers can distinguish live from retracted in a single call
+- `get_flags_for_subject(subject)` — returns all flag ids ever anchored against `subject`, including superseded ones; call `get_flag_with_supersession` on each id and filter out those with a non-`None` supersession to see only live flags
 - `propose_admin(candidate)` / `accept_admin()`
 
 ## Escrow Lifecycle — Sequence Diagram
@@ -230,7 +234,7 @@ Filed ──approve_claim (≥ threshold)──▶ Approved ──payout──�
 2. **Arbiter/Committee-Gated Actions**: `resolve` requires the specific escrow's arbiter; `set_coverage`/`anchor_flag` require the oracle; `approve_claim`/`reject_claim` require committee membership — all enforced via `require_auth`, not just a convention
 3. **Atomic Settlement**: Release, dispute-split, and claim payouts move funds in the same transaction as the state transition — no partial payouts
 4. **Solvency Guard**: `insurance-pool` rejects new active coverage that would push total exposure past `coverage_ratio_bps` of the pool's actual token balance
-5. **Immutable Registry**: Anchored fraud flags cannot be edited or removed once confirmed; timestamps come from the ledger clock, not the caller
+5. **Immutable Registry**: Anchored fraud flags cannot be edited or deleted once confirmed; timestamps come from the ledger clock, not the caller. If the oracle anchors a flag in error, `supersede_flag` attaches a `Supersession` record alongside the original without touching it — the original entry remains on-chain for tamper-evidence, while the supersession signals to consumers that the flag has been retracted
 6. **Timelocked Admin Handover**: Admin changes require a `propose_admin` → 48h wait → `accept_admin` flow on every contract (`astraguard-shared::timelock`)
 7. **TTL Extension**: Every persistent write and every state-changing call bumps storage TTL (`astraguard-shared::ttl`) so live data doesn't expire off the ledger between accesses
 8. **Checks-Effects-Interactions**: `escrow::release`/`resolve` and `insurance-pool::payout` write settled state (status, TTL, coverage totals) before invoking the token contract's `transfer`, not after — a panicking or malicious `asset` contract can't reenter to see (or exploit) stale `Active`/`Approved` state, and a failed transfer still rolls back the whole call in Soroban, so this costs nothing on the success path
@@ -276,7 +280,7 @@ stellar contract invoke --id <REGISTRY_ANCHOR_ID> --source <source-account> --ne
 
 1. **Escrow** — Buyer calls `create`; funds lock in one signed transaction. Seller (or anyone, post-timeout) calls `release` for the happy path. Either party can `dispute`; the arbiter's `resolve` call is final and moves funds per its `Decision`.
 2. **Insurance** — Premiums accumulate via `deposit_premium`. The oracle (driven by the backend's trust-score service) grants `Active` coverage via `set_coverage`, capped by the solvency guard. A victim files a claim; the claims committee reaches `approval_threshold` via `approve_claim` (or any member can `reject_claim`); an approved claim is disbursed via `payout`.
-3. **Registry** — Once the backend's two-person review confirms a fraud report, the oracle calls `anchor_flag`. The hash and ledger timestamp are permanent; anyone can call `get_flags_for_subject` before trusting an address.
+3. **Registry** — Once the backend's two-person review confirms a fraud report, the oracle calls `anchor_flag`. The hash and ledger timestamp are permanent; anyone can call `get_flags_for_subject` before trusting an address. If a flag was anchored in error, the oracle calls `supersede_flag` — the original record stays on-chain for tamper-evidence and a `Supersession` is attached alongside it. Consumers should use `get_flag_with_supersession` to distinguish live flags from retracted ones.
 
 ## Testing
 
@@ -287,7 +291,7 @@ cargo test --workspace
 Current unit test coverage, per contract (`contracts/<name>/src/test.rs`):
 - **escrow**: create + happy-path release; dispute → arbiter split resolution; non-party cannot dispute
 - **insurance-pool**: premium deposit → coverage → claim → committee approval → payout; coverage rejected beyond the solvency ratio; committee member rejection of a filed claim; non-committee members can't approve or reject
-- **registry-anchor**: anchor + query a flag by id and by subject; multiple flags accumulate per subject
+- **registry-anchor**: anchor + query a flag by id and by subject; multiple flags accumulate per subject; `supersede_flag` happy path, idempotency guard (`AlreadySuperseded`), and unknown-flag guard (`FlagNotFound`); `get_flag_with_supersession` returns live vs retracted state correctly
 
 Not yet covered: cross-contract integration scenarios (see `tests/README.md`), and this test suite has not been run against a live Rust/Soroban toolchain in this environment — verify with `cargo test --workspace` before relying on it.
 
@@ -305,6 +309,7 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 - [x] Conditional escrow (`create` / `release` / `dispute` / `resolve`) with a full state machine and unit tests
 - [x] Insurance pool with solvency-capped coverage, claim approval/rejection, and payout
 - [x] Registry anchor for confirmed fraud flags
+- [x] Oracle-only `supersede_flag` for retraction-without-deletion (tamper-evidence preserved)
 - [x] Timelocked admin handover and persistent-storage TTL management on all three contracts
 - [x] CI: build + test on every push/PR
 - [x] Checks-effects-interactions ordering on all fund-transferring calls (`escrow::release`/`resolve`, `insurance-pool::payout`)
@@ -353,7 +358,8 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 | Code | Error | Cause |
 |------|-------|-------|
 | 1 | `AlreadyInitialized` | `initialize` called twice |
-| 2 | `FlagNotFound` | Invalid or unknown `flag_id` |
+| 2 | `FlagNotFound` | Invalid or unknown `flag_id` in any flag query or `supersede_flag` |
+| 3 | `AlreadySuperseded` | `supersede_flag` called on a flag that has already been superseded |
 
 ## Events
 
@@ -369,6 +375,7 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 | insurance-pool | `claim_rejected` | `reject_claim` rejects a filed claim |
 | insurance-pool | `claim_paid` | `payout` disburses an approved claim |
 | registry-anchor | `flagged` | `anchor_flag` anchors a confirmed fraud flag |
+| registry-anchor | `flag_superseded` | `supersede_flag` retracts a previously anchored flag |
 | all three | `admin_proposed` | `propose_admin` starts the 48h timelock |
 | all three | `admin_changed` | `accept_admin` completes the handover |
 
