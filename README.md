@@ -122,10 +122,10 @@ Outcomes enforced on-chain once an arbiter resolves a dispute (`Decision`):
 ### `escrow`
 
 - `initialize(admin)` — one-time setup
-- `create(buyer, seller, arbiter, asset, amount, timeout, conditions)` — locks `amount` of `asset` from `buyer`; `conditions` is the hash of an off-chain terms document
+- `create(buyer, seller, arbiter, asset, amount, timeout, conditions)` — locks `amount` of `asset` from `buyer`; `arbiter` is a `MultisigConfig` (M-of-N signer set); `conditions` is the hash of an off-chain terms document
 - `release(escrow_id)` — buyer-authorized any time, or permissionless once `timeout` has passed
 - `dispute(escrow_id, caller, reason)` — `caller` must be the buyer or seller
-- `resolve(escrow_id, decision)` — arbiter-only, binding
+- `resolve(escrow_id, decision)` — arbiter multisig M-of-N binding resolution
 - `get_escrow(escrow_id)` — full record and status
 - `propose_admin(candidate)` / `accept_admin()` — timelocked admin handover
 
@@ -231,7 +231,7 @@ Filed ──approve_claim (≥ threshold)──▶ Approved ──payout──�
 ## Security Features
 
 1. **Escrow Fund Isolation**: Each escrow's funds and status are tracked independently — no commingling across buyers or sellers
-2. **Arbiter/Committee-Gated Actions**: `resolve` requires the specific escrow's arbiter; `set_coverage`/`anchor_flag` require the oracle; `approve_claim`/`reject_claim` require committee membership — all enforced via `require_auth`, not just a convention
+2. **Arbiter/Committee-Gated Actions**: `resolve` requires M-of-N authorisation from the escrow's arbiter multisig; `set_coverage`/`anchor_flag` require M-of-N authorisation from the oracle multisig; `approve_claim`/`reject_claim` require committee membership — all enforced via `require_auth` on each signer, not just a convention. A single compromised key cannot unilaterally resolve disputes or anchor false flags.
 3. **Atomic Settlement**: Release, dispute-split, and claim payouts move funds in the same transaction as the state transition — no partial payouts
 4. **Solvency Guard**: `insurance-pool` rejects new active coverage that would push total exposure past `coverage_ratio_bps` of the pool's actual token balance
 5. **Immutable Registry**: Anchored fraud flags cannot be edited or deleted once confirmed; timestamps come from the ledger clock, not the caller. If the oracle anchors a flag in error, `supersede_flag` attaches a `Supersession` record alongside the original without touching it — the original entry remains on-chain for tamper-evidence, while the supersession signals to consumers that the flag has been retracted
@@ -239,7 +239,7 @@ Filed ──approve_claim (≥ threshold)──▶ Approved ──payout──�
 7. **TTL Extension**: Every persistent write and every state-changing call bumps storage TTL (`astraguard-shared::ttl`) so live data doesn't expire off the ledger between accesses
 8. **Checks-Effects-Interactions**: `escrow::release`/`resolve` and `insurance-pool::payout` write settled state (status, TTL, coverage totals) before invoking the token contract's `transfer`, not after — a panicking or malicious `asset` contract can't reenter to see (or exploit) stale `Active`/`Approved` state, and a failed transfer still rolls back the whole call in Soroban, so this costs nothing on the success path
 
-**Known gaps, called out rather than hidden:** `arbiter`, `oracle`, and each committee member are currently single Stellar addresses, not on-chain multisig accounts — a real multisig/timelock behind each of those roles is real work before mainnet. There's also no pause/circuit-breaker function; none is implemented, so none is claimed here. TTL threshold/bump constants in `ttl.rs` are reasonable starting values, not tuned against a specific network's rent-fee economics yet. `env.events().publish(...)` is deprecated in favor of the `#[contractevent]` macro (soroban-sdk 26); migrating changes the on-chain event encoding, so it's left as a deliberate follow-up rather than a drive-by rename — see Roadmap.
+**Known gaps, called out rather than hidden:** There is no pause/circuit-breaker function; none is implemented, so none is claimed here. TTL threshold/bump constants in `ttl.rs` are reasonable starting values, not tuned against a specific network's rent-fee economics yet. `env.events().publish(...)` is deprecated in favor of the `#[contractevent]` macro (soroban-sdk 26); migrating changes the on-chain event encoding, so it's left as a deliberate follow-up rather than a drive-by rename — see Roadmap.
 
 ## Quick Start
 
@@ -269,11 +269,14 @@ stellar contract invoke --id <ESCROW_ID> --source <source-account> --network tes
   -- initialize --admin <ADMIN_ADDRESS>
 
 stellar contract invoke --id <INSURANCE_POOL_ID> --source <source-account> --network testnet \
-  -- initialize --admin <ADMIN_ADDRESS> --oracle <ORACLE_ADDRESS> --asset <TOKEN_ADDRESS> \
+  -- initialize --admin <ADMIN_ADDRESS> \
+     --oracle '{"signers":["<ORACLE_SIGNER_1>","<ORACLE_SIGNER_2>"],"threshold":2}' \
+     --asset <TOKEN_ADDRESS> \
      --coverage_ratio_bps 5000 --committee '[<MEMBER_1>,<MEMBER_2>]' --approval_threshold 2
 
 stellar contract invoke --id <REGISTRY_ANCHOR_ID> --source <source-account> --network testnet \
-  -- initialize --admin <ADMIN_ADDRESS> --oracle <ORACLE_ADDRESS>
+  -- initialize --admin <ADMIN_ADDRESS> \
+     --oracle '{"signers":["<ORACLE_SIGNER_1>","<ORACLE_SIGNER_2>"],"threshold":2}'
 ```
 
 ## How It Works
@@ -314,7 +317,7 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 - [x] CI: build + test on every push/PR
 - [x] Checks-effects-interactions ordering on all fund-transferring calls (`escrow::release`/`resolve`, `insurance-pool::payout`)
 - [ ] Migrate event emission from `env.events().publish(...)` to the `#[contractevent]` macro
-- [ ] Replace single-address `arbiter`/`oracle`/committee members with real multisig accounts
+- [x] Replace single-address `arbiter`/`oracle`/committee members with real multisig accounts
 - [ ] Cross-contract integration tests (see `tests/README.md`)
 - [ ] Validate TTL threshold/bump constants against target network rent economics
 - [ ] External audit
@@ -338,6 +341,7 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 | 6 | `AlreadySettled` | `release`/`dispute` called on a non-`Active` escrow |
 | 7 | `NotDisputed` | `resolve` called on an escrow that isn't `Disputed` |
 | 8 | `InvalidSplit` | `Decision::Split` basis points > 10000 |
+| 9 | `InvalidArbiterConfig` | `arbiter.threshold` is zero or exceeds the signer count |
 
 ### `insurance-pool`
 
@@ -352,6 +356,9 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 | 7 | `ClaimNotApproved` | `payout` called on a claim that isn't `Approved` |
 | 8 | `ClaimAlreadySettled` | `approve_claim`/`reject_claim` called on a claim that isn't `Filed` |
 | 9 | `InsufficientPoolBalance` | `payout` amount exceeds the pool's current token balance |
+| 10 | `AlreadyCommitteeMember` | `add_committee_member` called with an address already on the committee |
+| 11 | `MemberNotFound` | `remove_committee_member` called with an address not on the committee |
+| 12 | `InvalidOracleConfig` | `oracle.threshold` is zero or exceeds the signer count at `initialize` |
 
 ### `registry-anchor`
 
@@ -360,6 +367,7 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 | 1 | `AlreadyInitialized` | `initialize` called twice |
 | 2 | `FlagNotFound` | Invalid or unknown `flag_id` in any flag query or `supersede_flag` |
 | 3 | `AlreadySuperseded` | `supersede_flag` called on a flag that has already been superseded |
+| 4 | `InvalidOracleConfig` | `oracle.threshold` is zero or exceeds the signer count at `initialize` |
 
 ## Events
 
@@ -374,10 +382,14 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 | insurance-pool | `claim_filed` | `file_claim` registers a new claim |
 | insurance-pool | `claim_rejected` | `reject_claim` rejects a filed claim |
 | insurance-pool | `claim_paid` | `payout` disburses an approved claim |
+| insurance-pool | `committee_added` | `add_committee_member` adds a new committee member |
+| insurance-pool | `committee_removed` | `remove_committee_member` removes a committee member |
 | registry-anchor | `flagged` | `anchor_flag` anchors a confirmed fraud flag |
 | registry-anchor | `flag_superseded` | `supersede_flag` retracts a previously anchored flag |
 | all three | `admin_proposed` | `propose_admin` starts the 48h timelock |
 | all three | `admin_changed` | `accept_admin` completes the handover |
+| insurance-pool, registry-anchor | `oracle_proposed` | `propose_oracle` starts the 48h oracle rotation timelock |
+| insurance-pool, registry-anchor | `oracle_changed` | `accept_oracle` completes the oracle rotation |
 
 ## License
 
