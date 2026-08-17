@@ -238,6 +238,7 @@ Filed ──approve_claim (≥ threshold)──▶ Approved ──payout──�
 6. **Timelocked Admin Handover**: Admin changes require a `propose_admin` → 48h wait → `accept_admin` flow on every contract (`astraguard-shared::timelock`)
 7. **TTL Extension**: Every persistent write and every state-changing call bumps storage TTL (`astraguard-shared::ttl`) so live data doesn't expire off the ledger between accesses
 8. **Checks-Effects-Interactions**: `escrow::release`/`resolve` and `insurance-pool::payout` write settled state (status, TTL, coverage totals) before invoking the token contract's `transfer`, not after — a panicking or malicious `asset` contract can't reenter to see (or exploit) stale `Active`/`Approved` state, and a failed transfer still rolls back the whole call in Soroban, so this costs nothing on the success path
+9. **Freeze Semantics on Payout**: `insurance-pool::payout` re-checks the project's coverage status at disbursement time, not just at `file_claim`. If the oracle suspends or removes coverage after a claim is filed or approved (e.g. because a fraud flag is anchored via the registry), `payout` returns `CoverageSuspended` and no funds move — the claim stays in `Approved` state for the committee to re-evaluate
 
 **Known gaps, called out rather than hidden:** There is no pause/circuit-breaker function; none is implemented, so none is claimed here. TTL threshold/bump constants in `ttl.rs` are reasonable starting values, not tuned against a specific network's rent-fee economics yet. `env.events().publish(...)` is deprecated in favor of the `#[contractevent]` macro (soroban-sdk 26); migrating changes the on-chain event encoding, so it's left as a deliberate follow-up rather than a drive-by rename — see Roadmap.
 
@@ -316,12 +317,13 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 - [x] Timelocked admin handover and persistent-storage TTL management on all three contracts
 - [x] CI: build + test on every push/PR
 - [x] Checks-effects-interactions ordering on all fund-transferring calls (`escrow::release`/`resolve`, `insurance-pool::payout`)
+- [x] Freeze semantics for `insurance-pool::payout` — coverage status is re-checked at payout time; a project suspended or removed after filing/approval returns `CoverageSuspended` and blocks disbursement
 - [ ] Migrate event emission from `env.events().publish(...)` to the `#[contractevent]` macro
 - [x] Replace single-address `arbiter`/`oracle`/committee members with real multisig accounts
 - [ ] Cross-contract integration tests (see `tests/README.md`)
 - [ ] Validate TTL threshold/bump constants against target network rent economics
 - [ ] External audit
-- [ ] Mainnet launch
+- [ ] Mainnet launch — see [`docs/mainnet-readiness.md`](docs/mainnet-readiness.md) for the full gate checklist (closes #11)
 
 ## Dependencies
 
@@ -356,9 +358,9 @@ Insurance pool and registry anchor are scaffolded and unit-tested but not yet wi
 | 7 | `ClaimNotApproved` | `payout` called on a claim that isn't `Approved` |
 | 8 | `ClaimAlreadySettled` | `approve_claim`/`reject_claim` called on a claim that isn't `Filed` |
 | 9 | `InsufficientPoolBalance` | `payout` amount exceeds the pool's current token balance |
-| 10 | `AlreadyCommitteeMember` | `add_committee_member` called with an address already on the committee |
-| 11 | `MemberNotFound` | `remove_committee_member` called with an address not on the committee |
-| 12 | `InvalidOracleConfig` | `oracle.threshold` is zero or exceeds the signer count at `initialize` |
+| 10 | `AlreadyCommitteeMember` | `add_committee_member` called for an address already on the committee |
+| 11 | `MemberNotFound` | `remove_committee_member` called for an address not on the committee |
+| 12 | `CoverageSuspended` | `payout` called for a claim whose project's coverage is no longer `Active`; suspension after filing or approval blocks payout (Freeze semantics) |
 
 ### `registry-anchor`
 

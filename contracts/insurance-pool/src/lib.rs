@@ -37,9 +37,12 @@ pub enum Error {
     AlreadyCommitteeMember = 10,
     /// Returned when trying to remove a member who is not on the committee.
     MemberNotFound = 11,
-    /// The oracle multisig config is invalid (threshold zero or exceeds
-    /// signer count).
-    InvalidOracleConfig = 12,
+    /// `payout` was called for a claim whose project's coverage is no longer
+    /// `Active` (e.g. the oracle suspended or removed coverage after the claim
+    /// was filed or approved). Freeze semantics: suspension blocks any payout
+    /// that has not yet reached `PaidOut`, regardless of when the claim was
+    /// filed or approved.
+    CoverageSuspended = 12,
 }
 
 #[contracttype]
@@ -360,10 +363,27 @@ impl InsurancePoolContract {
     }
 
     /// Disburses an approved claim from pooled capital.
+    ///
+    /// Implements **Freeze semantics**: coverage status is re-checked at
+    /// payout time, not just at `file_claim`. If the oracle has suspended or
+    /// removed the project's coverage since the claim was filed or approved
+    /// (e.g. after a fraud flag is confirmed via the registry-anchor), this
+    /// call returns `Error::CoverageSuspended` and no funds move. The claim
+    /// remains in `Approved` state so the committee can re-evaluate once
+    /// coverage is restored, or reject it explicitly.
     pub fn payout(env: Env, claim_id: u64) -> Result<(), Error> {
         let mut claim = Self::get_claim(env.clone(), claim_id)?;
         if claim.status != ClaimStatus::Approved {
             return Err(Error::ClaimNotApproved);
+        }
+
+        // Freeze semantics: re-check coverage status at payout time.
+        // A suspended or removed project must not pay out claims that haven't
+        // already reached PaidOut, even if those claims were filed or approved
+        // while coverage was still Active.
+        let coverage = Self::get_coverage(env.clone(), claim.project.clone());
+        if coverage.status != CoverageStatus::Active {
+            return Err(Error::CoverageSuspended);
         }
 
         let asset = Self::asset(&env);
