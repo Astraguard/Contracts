@@ -1,9 +1,14 @@
 #![no_std]
 
-//! Registry anchor: oracle-only append of confirmed fraud flags. Purpose:
-//! public, tamper-evident proof of *when* an address was flagged. The full
-//! report (evidence, victim data) is expected to live off-chain; only a
-//! hash is anchored here.
+//! Registry anchor: oracle-multisig-only append of confirmed fraud flags.
+//! Purpose: public, tamper-evident proof of *when* an address was flagged.
+//! The full report (evidence, victim data) is expected to live off-chain;
+//! only a hash is anchored here.
+//!
+//! The oracle role is now a `MultisigConfig` — a threshold-of-N set of
+//! signers.  All oracle-gated operations (`anchor_flag`, `supersede_flag`)
+//! require at least `oracle.threshold` of the registered oracle signers
+//! to co-sign the transaction, replacing the original single-address model.
 //!
 //! The anchor's timestamp is taken from `env.ledger().timestamp()` rather
 //! than accepted as a caller-supplied argument — a caller-supplied
@@ -27,7 +32,7 @@
 #[cfg(test)]
 mod test;
 
-use astraguard_shared::{access, timelock, ttl};
+use astraguard_shared::{access, access::MultisigConfig, timelock, ttl};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
 };
@@ -39,6 +44,9 @@ pub enum Error {
     AlreadyInitialized = 1,
     FlagNotFound = 2,
     AlreadySuperseded = 3,
+    /// The oracle multisig config is invalid (threshold zero or exceeds
+    /// signer count).
+    InvalidOracleConfig = 4,
 }
 
 #[contracttype]
@@ -61,7 +69,10 @@ pub struct Flag {
     pub record_hash: BytesN<32>,
     pub category: FlagCategory,
     pub anchored_at: u64,
-    pub anchored_by: Address,
+    /// The oracle *multisig config* that authorised this flag.  Stored as a
+    /// snapshot of the signer set at anchor time so the historical record
+    /// remains auditable even after the live oracle config rotates.
+    pub anchored_by: MultisigConfig,
 }
 
 /// Attached to a `Flag` when the oracle determines it was anchored in
@@ -73,13 +84,13 @@ pub struct Flag {
 ///   document explaining why this flag is being retracted.
 /// - `superseded_at`: ledger timestamp at which the supersession was
 ///   anchored — taken from the ledger clock, not caller-supplied.
-/// - `superseded_by`: oracle address that issued the supersession.
+/// - `superseded_by`: oracle multisig config that issued the supersession.
 #[contracttype]
 #[derive(Clone)]
 pub struct Supersession {
     pub reason_hash: BytesN<32>,
     pub superseded_at: u64,
-    pub superseded_by: Address,
+    pub superseded_by: MultisigConfig,
 }
 
 /// Convenience wrapper returned by `get_flag_with_supersession`.
@@ -106,9 +117,16 @@ pub struct RegistryAnchorContract;
 
 #[contractimpl]
 impl RegistryAnchorContract {
-    pub fn initialize(env: Env, admin: Address, oracle: Address) -> Result<(), Error> {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        oracle: MultisigConfig,
+    ) -> Result<(), Error> {
         if access::has_admin(&env) {
             return Err(Error::AlreadyInitialized);
+        }
+        if oracle.threshold == 0 || oracle.threshold > oracle.signers.len() {
+            return Err(Error::InvalidOracleConfig);
         }
         access::set_admin(&env, &admin);
         access::set_oracle(&env, &oracle);
@@ -117,8 +135,11 @@ impl RegistryAnchorContract {
         Ok(())
     }
 
-    /// Oracle-only: permanently anchors a confirmed fraud flag against
-    /// `subject`. Returns the new flag's id.
+    /// Oracle-multisig-only: permanently anchors a confirmed fraud flag
+    /// against `subject`.  Returns the new flag's id.
+    ///
+    /// Requires at least `oracle.threshold` of the registered oracle signers
+    /// to co-sign the transaction.
     pub fn anchor_flag(
         env: Env,
         subject: Address,
@@ -126,6 +147,8 @@ impl RegistryAnchorContract {
         category: FlagCategory,
     ) -> u64 {
         access::require_oracle(&env);
+
+        let oracle_config = access::get_oracle(&env);
 
         let flag_id: u64 = env
             .storage()
@@ -137,7 +160,7 @@ impl RegistryAnchorContract {
             record_hash,
             category,
             anchored_at: env.ledger().timestamp(),
-            anchored_by: access::get_oracle(&env),
+            anchored_by: oracle_config,
         };
 
         env.storage()
@@ -170,7 +193,7 @@ impl RegistryAnchorContract {
         flag_id
     }
 
-    /// Oracle-only: marks a previously anchored flag as superseded
+    /// Oracle-multisig-only: marks a previously anchored flag as superseded
     /// (retracted/corrected) without deleting the original record.
     ///
     /// The original `Flag` entry is left completely untouched — tamper-
@@ -299,17 +322,18 @@ impl RegistryAnchorContract {
         timelock::execute_admin_change(&env)
     }
 
-    /// Admin proposes a new oracle address. The proposal enters a 48-hour
-    /// timelock (same as admin handover) before `accept_oracle` can execute
-    /// it, giving observers a window to notice and react to a compromised
-    /// oracle key before it is formally replaced.
-    pub fn propose_oracle(env: Env, candidate: Address) {
+    /// Admin proposes a new oracle multisig config. The proposal enters a
+    /// 48-hour timelock (same as admin handover) before `accept_oracle` can
+    /// execute it, giving observers a window to notice and react to a
+    /// compromised oracle key before it is formally replaced.
+    pub fn propose_oracle(env: Env, candidate: MultisigConfig) {
         timelock::propose_oracle_change(&env, candidate);
     }
 
     /// Executes a previously proposed oracle change once the 48-hour
     /// timelock has elapsed. Callable by anyone — the delay is the guard.
-    pub fn accept_oracle(env: Env) -> Address {
+    /// Returns the newly active `MultisigConfig`.
+    pub fn accept_oracle(env: Env) -> MultisigConfig {
         timelock::execute_oracle_change(&env)
     }
 }

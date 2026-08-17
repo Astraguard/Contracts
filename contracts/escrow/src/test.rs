@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use super::*;
+use astraguard_shared::access::MultisigConfig;
 use soroban_sdk::testutils::Address as _;
+use soroban_sdk::vec;
 
 fn issue_token<'a>(
     env: &'a Env,
@@ -24,6 +26,18 @@ fn setup(env: &Env) -> (Address, EscrowContractClient<'_>) {
     (contract_id, client)
 }
 
+/// Build a 2-of-3 arbiter multisig for use in tests.
+fn make_arbiter(env: &Env) -> (MultisigConfig, Address, Address, Address) {
+    let s1 = Address::generate(env);
+    let s2 = Address::generate(env);
+    let s3 = Address::generate(env);
+    let config = MultisigConfig {
+        signers: vec![env, s1.clone(), s2.clone(), s3.clone()],
+        threshold: 2,
+    };
+    (config, s1, s2, s3)
+}
+
 #[test]
 fn create_and_release_happy_path() {
     let env = Env::default();
@@ -33,7 +47,7 @@ fn create_and_release_happy_path() {
     let token_admin = Address::generate(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let arbiter = Address::generate(&env);
+    let (arbiter, _, _, _) = make_arbiter(&env);
 
     let (asset, asset_admin, token_client) = issue_token(&env, &token_admin);
     asset_admin.mint(&buyer, &1_000);
@@ -60,7 +74,7 @@ fn create_and_release_happy_path() {
 }
 
 #[test]
-fn dispute_resolves_with_split() {
+fn dispute_resolves_with_split_multisig_arbiter() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -68,7 +82,9 @@ fn dispute_resolves_with_split() {
     let token_admin = Address::generate(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let arbiter = Address::generate(&env);
+    // 2-of-3 arbiter: all three in the config, threshold = 2.
+    // mock_all_auths() satisfies every require_auth, so all three would pass.
+    let (arbiter, _, _, _) = make_arbiter(&env);
 
     let (asset, asset_admin, token_client) = issue_token(&env, &token_admin);
     asset_admin.mint(&buyer, &1_000);
@@ -88,10 +104,81 @@ fn dispute_resolves_with_split() {
     let reason = BytesN::from_array(&env, &[2u8; 32]);
     client.dispute(&escrow_id, &buyer, &reason);
 
+    // With mock_all_auths the M-of-N check is satisfied automatically.
     client.resolve(&escrow_id, &Decision::Split(6_000));
 
     assert_eq!(token_client.balance(&seller), 600);
     assert_eq!(token_client.balance(&buyer), 400);
+    assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Resolved);
+}
+
+#[test]
+fn dispute_resolves_release_to_seller_multisig_arbiter() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client) = setup(&env);
+    let token_admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (arbiter, _, _, _) = make_arbiter(&env);
+
+    let (asset, asset_admin, token_client) = issue_token(&env, &token_admin);
+    asset_admin.mint(&buyer, &1_000);
+
+    let conditions = BytesN::from_array(&env, &[5u8; 32]);
+    let timeout = env.ledger().timestamp() + 3600;
+    let escrow_id = client.create(
+        &buyer,
+        &seller,
+        &arbiter,
+        &asset,
+        &1_000,
+        &timeout,
+        &conditions,
+    );
+
+    let reason = BytesN::from_array(&env, &[6u8; 32]);
+    client.dispute(&escrow_id, &seller, &reason);
+    client.resolve(&escrow_id, &Decision::ReleaseToSeller);
+
+    assert_eq!(token_client.balance(&seller), 1_000);
+    assert_eq!(token_client.balance(&buyer), 0);
+    assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Resolved);
+}
+
+#[test]
+fn dispute_resolves_refund_to_buyer_multisig_arbiter() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client) = setup(&env);
+    let token_admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let (arbiter, _, _, _) = make_arbiter(&env);
+
+    let (asset, asset_admin, token_client) = issue_token(&env, &token_admin);
+    asset_admin.mint(&buyer, &1_000);
+
+    let conditions = BytesN::from_array(&env, &[7u8; 32]);
+    let timeout = env.ledger().timestamp() + 3600;
+    let escrow_id = client.create(
+        &buyer,
+        &seller,
+        &arbiter,
+        &asset,
+        &1_000,
+        &timeout,
+        &conditions,
+    );
+
+    let reason = BytesN::from_array(&env, &[8u8; 32]);
+    client.dispute(&escrow_id, &buyer, &reason);
+    client.resolve(&escrow_id, &Decision::RefundToBuyer);
+
+    assert_eq!(token_client.balance(&buyer), 1_000);
+    assert_eq!(token_client.balance(&seller), 0);
     assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Resolved);
 }
 
@@ -104,7 +191,7 @@ fn non_party_cannot_dispute() {
     let token_admin = Address::generate(&env);
     let buyer = Address::generate(&env);
     let seller = Address::generate(&env);
-    let arbiter = Address::generate(&env);
+    let (arbiter, _, _, _) = make_arbiter(&env);
     let stranger = Address::generate(&env);
 
     let (asset, asset_admin, _) = issue_token(&env, &token_admin);
@@ -125,6 +212,39 @@ fn non_party_cannot_dispute() {
     let reason = BytesN::from_array(&env, &[4u8; 32]);
     let result = client.try_dispute(&escrow_id, &stranger, &reason);
     assert_eq!(result, Err(Ok(Error::NotParty)));
+}
+
+#[test]
+fn invalid_arbiter_config_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client) = setup(&env);
+    let token_admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    let (asset, asset_admin, _) = issue_token(&env, &token_admin);
+    asset_admin.mint(&buyer, &1_000);
+
+    let conditions = BytesN::from_array(&env, &[9u8; 32]);
+    let timeout = env.ledger().timestamp() + 3600;
+
+    // threshold > signer count — must fail.
+    let bad_arbiter = MultisigConfig {
+        signers: vec![&env, Address::generate(&env)],
+        threshold: 2,
+    };
+    let result = client.try_create(
+        &buyer,
+        &seller,
+        &bad_arbiter,
+        &asset,
+        &500,
+        &timeout,
+        &conditions,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidArbiterConfig)));
 }
 
 // =============================================================================

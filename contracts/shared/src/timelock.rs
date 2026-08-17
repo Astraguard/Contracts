@@ -1,4 +1,4 @@
-use crate::access;
+use crate::access::{self, MultisigConfig};
 use soroban_sdk::{contracttype, Address, Env, Symbol};
 
 /// Delay between an admin change being proposed and it taking effect, so
@@ -20,7 +20,7 @@ struct PendingAdmin {
 #[contracttype]
 #[derive(Clone)]
 struct PendingOracle {
-    candidate: Address,
+    candidate: MultisigConfig,
     ready_at: u64,
 }
 
@@ -73,11 +73,11 @@ pub fn execute_admin_change(env: &Env) -> Address {
     pending.candidate
 }
 
-/// Current admin proposes a new oracle. The same 48-hour timelock as
-/// admin handover applies — the oracle has unilateral write access to
-/// coverage status and fraud flags, so its rotation should be equally
+/// Current admin proposes a new oracle multisig config. The same 48-hour
+/// timelock as admin handover applies — the oracle has unilateral write access
+/// to coverage status and fraud flags, so its rotation should be equally
 /// visible before it takes effect.
-pub fn propose_oracle_change(env: &Env, candidate: Address) {
+pub fn propose_oracle_change(env: &Env, candidate: MultisigConfig) {
     access::require_admin(env);
 
     let ready_at = env.ledger().timestamp() + ORACLE_TIMELOCK_SECONDS;
@@ -89,13 +89,15 @@ pub fn propose_oracle_change(env: &Env, candidate: Address) {
         },
     );
 
-    env.events()
-        .publish((Symbol::new(env, "oracle_proposed"),), (candidate, ready_at));
+    env.events().publish(
+        (Symbol::new(env, "oracle_proposed"),),
+        (candidate.signers, candidate.threshold, ready_at),
+    );
 }
 
 /// Executes a previously proposed oracle change once the timelock has
 /// elapsed. Callable by anyone — the delay itself is the safeguard.
-pub fn execute_oracle_change(env: &Env) -> Address {
+pub fn execute_oracle_change(env: &Env) -> MultisigConfig {
     let pending: PendingOracle = env
         .storage()
         .instance()
@@ -113,7 +115,10 @@ pub fn execute_oracle_change(env: &Env) -> Address {
 
     env.events().publish(
         (Symbol::new(env, "oracle_changed"),),
-        pending.candidate.clone(),
+        (
+            pending.candidate.signers.clone(),
+            pending.candidate.threshold,
+        ),
     );
 
     pending.candidate
@@ -123,7 +128,7 @@ pub fn execute_oracle_change(env: &Env) -> Address {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
-    use soroban_sdk::{contract, contractimpl, Env};
+    use soroban_sdk::{contract, contractimpl, vec, Env};
 
     // ---------------------------------------------------------------------------
     // Minimal test contract — gives us a real contract instance so that
@@ -146,11 +151,11 @@ mod tests {
             execute_admin_change(&env)
         }
 
-        pub fn propose_oracle_fn(env: Env, candidate: Address) {
+        pub fn propose_oracle_fn(env: Env, candidate: MultisigConfig) {
             propose_oracle_change(&env, candidate);
         }
 
-        pub fn accept_oracle_fn(env: Env) -> Address {
+        pub fn accept_oracle_fn(env: Env) -> MultisigConfig {
             execute_oracle_change(&env)
         }
 
@@ -164,6 +169,16 @@ mod tests {
         let client = TimelockTestContractClient::new(env, &id);
         client.init(admin);
         client
+    }
+
+    fn make_oracle(env: &Env) -> (MultisigConfig, Address, Address) {
+        let s1 = Address::generate(env);
+        let s2 = Address::generate(env);
+        let config = MultisigConfig {
+            signers: vec![env, s1.clone(), s2.clone()],
+            threshold: 2,
+        };
+        (config, s1, s2)
     }
 
     // ---------------------------------------------------------------------------
@@ -264,7 +279,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Oracle handover — happy path (mirrors admin tests)
+    // Oracle handover — happy path (mirrors admin tests, now uses MultisigConfig)
     // ---------------------------------------------------------------------------
 
     #[test]
@@ -273,17 +288,18 @@ mod tests {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let new_oracle = Address::generate(&env);
         let client = deploy(&env, &admin);
+        let (new_oracle_config, s1, _s2) = make_oracle(&env);
 
         let t0: u64 = 1_000_000;
         env.ledger().set_timestamp(t0);
 
-        client.propose_oracle_fn(&new_oracle);
+        client.propose_oracle_fn(&new_oracle_config);
 
         env.ledger().set_timestamp(t0 + ORACLE_TIMELOCK_SECONDS);
         let returned = client.accept_oracle_fn();
-        assert_eq!(returned, new_oracle);
+        assert_eq!(returned.signers.get(0).unwrap(), s1);
+        assert_eq!(returned.threshold, 2);
     }
 
     // ---------------------------------------------------------------------------
@@ -297,13 +313,13 @@ mod tests {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let new_oracle = Address::generate(&env);
         let client = deploy(&env, &admin);
+        let (new_oracle_config, _, _) = make_oracle(&env);
 
         let t0: u64 = 1_000_000;
         env.ledger().set_timestamp(t0);
 
-        client.propose_oracle_fn(&new_oracle);
+        client.propose_oracle_fn(&new_oracle_config);
         env.ledger().set_timestamp(t0 + ORACLE_TIMELOCK_SECONDS - 1);
         client.accept_oracle_fn(); // must panic
     }

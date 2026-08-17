@@ -2,15 +2,21 @@
 
 //! Conditional payment escrow: `create` locks funds, `release` settles to
 //! the seller (buyer-confirmed or after timeout), `dispute` freezes an
-//! active escrow, and `resolve` is the arbiter's binding decision. A future
-//! iteration could lean on Stellar-native claimable balances instead of
-//! holding funds in contract storage directly; this version uses a plain
-//! token-transfer hold, which is simpler to reason about for the MVP.
+//! active escrow, and `resolve` is the arbiter multisig's binding decision.
+//!
+//! The `arbiter` is now a `MultisigConfig` — a threshold-of-N set of
+//! signers that must all authorise the `resolve` call, replacing the
+//! original single-address model.  This mirrors the insurance-pool
+//! committee's M-of-N approval pattern, generalised to dispute resolution.
+//!
+//! A future iteration could lean on Stellar-native claimable balances
+//! instead of holding funds in contract storage directly; this version uses
+//! a plain token-transfer hold, which is simpler to reason about for the MVP.
 
 #[cfg(test)]
 mod test;
 
-use astraguard_shared::{access, timelock, ttl};
+use astraguard_shared::{access, access::MultisigConfig, timelock, ttl};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol,
 };
@@ -27,6 +33,9 @@ pub enum Error {
     AlreadySettled = 6,
     NotDisputed = 7,
     InvalidSplit = 8,
+    /// The arbiter multisig config is invalid (e.g. threshold > signer count
+    /// or threshold is zero).
+    InvalidArbiterConfig = 9,
 }
 
 #[contracttype]
@@ -43,7 +52,9 @@ pub enum EscrowStatus {
 pub struct Escrow {
     pub buyer: Address,
     pub seller: Address,
-    pub arbiter: Address,
+    /// M-of-N arbiter multisig.  At least `arbiter.threshold` of the listed
+    /// signers must co-sign the `resolve` transaction.
+    pub arbiter: MultisigConfig,
     pub asset: Address,
     pub amount: i128,
     pub timeout: u64,
@@ -86,13 +97,18 @@ impl EscrowContract {
     }
 
     /// Locks `amount` of `asset` from `buyer` under `conditions`, refereed by
-    /// `arbiter` if a dispute is raised. Returns the new escrow's id.
+    /// the `arbiter` multisig if a dispute is raised.  Returns the new
+    /// escrow's id.
+    ///
+    /// `arbiter` is a `MultisigConfig` — a threshold-of-N set of signers.
+    /// Passing a config with `threshold = 1` and a single signer preserves
+    /// the original single-address behaviour.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         env: Env,
         buyer: Address,
         seller: Address,
-        arbiter: Address,
+        arbiter: MultisigConfig,
         asset: Address,
         amount: i128,
         timeout: u64,
@@ -105,6 +121,9 @@ impl EscrowContract {
         }
         if timeout <= env.ledger().timestamp() {
             return Err(Error::InvalidTimeout);
+        }
+        if arbiter.threshold == 0 || arbiter.threshold > arbiter.signers.len() {
+            return Err(Error::InvalidArbiterConfig);
         }
 
         token::Client::new(&env, &asset).transfer(&buyer, env.current_contract_address(), &amount);
@@ -224,14 +243,21 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Arbiter-only binding resolution of a disputed escrow.
+    /// Arbiter multisig binding resolution of a disputed escrow.
+    ///
+    /// The transaction must carry `require_auth` from at least
+    /// `escrow.arbiter.threshold` of the registered arbiter signers.  This
+    /// is the M-of-N enforcement — a single compromised arbiter key is
+    /// insufficient to resolve a dispute unilaterally.
     pub fn resolve(env: Env, escrow_id: u64, decision: Decision) -> Result<(), Error> {
         let mut escrow = Self::get_escrow(env.clone(), escrow_id)?;
 
         if escrow.status != EscrowStatus::Disputed {
             return Err(Error::NotDisputed);
         }
-        escrow.arbiter.require_auth();
+
+        // Enforce M-of-N arbiter authorisation.
+        escrow.arbiter.require_multisig_auth(&env);
 
         // Split share is computed (and validated) up front so the state mutation
         // below can't be followed by an error return.

@@ -1,16 +1,21 @@
 #![no_std]
 
 //! Insurance pool: `deposit_premium` brings funds in, `set_coverage` is
-//! oracle-only (intended to be driven by an off-chain trust-score service),
-//! `file_claim` registers a claim on-chain, and `payout` requires M-of-N
-//! approval from the claims committee. Solvency guard: total active
+//! oracle-multisig-only (intended to be driven by an off-chain trust-score
+//! service), `file_claim` registers a claim on-chain, and `payout` requires
+//! M-of-N approval from the claims committee. Solvency guard: total active
 //! coverage exposure must stay within `coverage_ratio_bps` of the pool's
 //! token balance.
+//!
+//! The `oracle` role is now a `MultisigConfig` — a threshold-of-N set of
+//! signers.  All oracle-gated operations (`set_coverage`) require at least
+//! `oracle.threshold` of the registered oracle signers to co-sign the
+//! transaction.
 
 #[cfg(test)]
 mod test;
 
-use astraguard_shared::{access, timelock, ttl};
+use astraguard_shared::{access, access::MultisigConfig, timelock, ttl};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
 };
@@ -99,7 +104,7 @@ impl InsurancePoolContract {
     pub fn initialize(
         env: Env,
         admin: Address,
-        oracle: Address,
+        oracle: MultisigConfig,
         asset: Address,
         coverage_ratio_bps: u32,
         committee: Vec<Address>,
@@ -107,6 +112,9 @@ impl InsurancePoolContract {
     ) -> Result<(), Error> {
         if access::has_admin(&env) {
             return Err(Error::AlreadyInitialized);
+        }
+        if oracle.threshold == 0 || oracle.threshold > oracle.signers.len() {
+            return Err(Error::InvalidOracleConfig);
         }
         access::set_admin(&env, &admin);
         access::set_oracle(&env, &oracle);
@@ -149,9 +157,12 @@ impl InsurancePoolContract {
         Ok(())
     }
 
-    /// Oracle-only: sets a project's coverage status, driven off-chain by
-    /// the trust score service. Rejects new active coverage that would push
-    /// total exposure past the pool's solvency ratio.
+    /// Oracle-multisig-only: sets a project's coverage status, driven
+    /// off-chain by the trust score service.  Rejects new active coverage
+    /// that would push total exposure past the pool's solvency ratio.
+    ///
+    /// Requires at least `oracle.threshold` of the registered oracle signers
+    /// to co-sign the transaction.
     pub fn set_coverage(
         env: Env,
         project: Address,
@@ -450,17 +461,18 @@ impl InsurancePoolContract {
         timelock::execute_admin_change(&env)
     }
 
-    /// Admin proposes a new oracle address. The proposal enters a 48-hour
-    /// timelock (same as admin handover) before `accept_oracle` can execute
-    /// it, giving observers a window to notice and react to a compromised
-    /// oracle key before it is formally replaced.
-    pub fn propose_oracle(env: Env, candidate: Address) {
+    /// Admin proposes a new oracle multisig config. The proposal enters a
+    /// 48-hour timelock (same as admin handover) before `accept_oracle` can
+    /// execute it, giving observers a window to notice and react to a
+    /// compromised oracle key before it is formally replaced.
+    pub fn propose_oracle(env: Env, candidate: MultisigConfig) {
         timelock::propose_oracle_change(&env, candidate);
     }
 
     /// Executes a previously proposed oracle change once the 48-hour
     /// timelock has elapsed. Callable by anyone — the delay is the guard.
-    pub fn accept_oracle(env: Env) -> Address {
+    /// Returns the newly active `MultisigConfig`.
+    pub fn accept_oracle(env: Env) -> MultisigConfig {
         timelock::execute_oracle_change(&env)
     }
 
